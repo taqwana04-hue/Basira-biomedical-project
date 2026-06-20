@@ -1,0 +1,671 @@
+/**********************************************************************
+ *
+ *  BasarAssistant.ino
+ *  BASAR Desktop Assistant — Firmware v2.0.0 (BLE)
+ *
+ *  Hardware:
+ *    ESP32 DevKit v1
+ *    ILI9488 3.5" SPI TFT (320x480 portrait)
+ *
+ *  Wiring:
+ *    VCC   → 3.3V
+ *    GND   → GND
+ *    CS    → GPIO 5
+ *    RESET → GPIO 4
+ *    DC    → GPIO 2
+ *    MOSI  → GPIO 23
+ *    SCK   → GPIO 18
+ *    MISO  → GPIO 19
+ *    LED   → 3.3V
+ *
+ *  Library: TFT_eSPI (display) + ESP32 BLE Arduino (built-in with ESP32 board package)
+ *
+ *  Role: BLE GATT CLIENT (central). Scans for a device named "BASIRA" advertising the
+ *  BASIRA service UUID, connects, subscribes to notifications on the data
+ *  characteristic, decodes the packed binary BasiraPacket, and drives the dashboard.
+ *
+ *  Auto-reconnect: on disconnect, falls back to STATE_WAITING (red dot, "Waiting for
+ *  BASIRA") and resumes scanning automatically so it reconnects when back in range —
+ *  no button press or reset needed.
+ *
+ *********************************************************************/
+
+#include <SPI.h>
+#include <TFT_eSPI.h>
+
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include <BLEClient.h>
+
+#include "BasiraProtocol.h"   // shared contract — copy must match glasses' copy exactly
+
+TFT_eSPI tft = TFT_eSPI();
+
+/*************************************************************
+                        COLORS
+*************************************************************/
+
+#define BG_COLOR         TFT_BLACK
+#define BASAR_BLUE       0x1D9F
+#define DARK_BLUE        0x08D4
+#define PANEL_COLOR      0x18C3
+#define CARD_COLOR       0x1082
+
+#define COLOR_HEALTHY        0x07E0
+#define COLOR_MONITORING     0xFFE0
+#define COLOR_MILD_FATIGUE   0xFD20
+#define COLOR_VISUAL_FATIGUE 0xF800
+#define COLOR_HIGH_STRESS    0xF81F
+#define COLOR_WAITING        0x8410
+
+/*************************************************************
+                        SCREEN
+*************************************************************/
+
+#define SCREEN_W  320
+#define SCREEN_H  480
+
+/*************************************************************
+                     FACE POSITION
+*************************************************************/
+
+#define FACE_X  160
+#define FACE_Y  155
+#define FACE_R  72
+
+/*************************************************************
+                        TIMING
+*************************************************************/
+
+#define BLINK_INTERVAL_MS     4500
+#define BLINK_HOLD_MS         120
+#define BLE_LINK_TIMEOUT_MS   3000   // no packet within this window → treat as disconnected
+#define BLE_RECONNECT_SCAN_MS 4000   // how long each scan pass runs before retrying
+
+/*************************************************************
+                        STATES (local display states)
+*************************************************************/
+
+enum SystemState
+{
+    STATE_BOOT,
+    STATE_WAITING,
+    STATE_HEALTHY,
+    STATE_MONITORING,
+    STATE_MILD_FATIGUE,
+    STATE_VISUAL_FATIGUE,
+    STATE_HIGH_STRESS
+};
+
+/*************************************************************
+                     SENSOR DATA (decoded from BLE packet)
+*************************************************************/
+
+float       heartRate  = 0.0;
+float       blinkRate  = 0.0;
+float       hrv        = 0.0;
+int         gsrRaw     = 0;
+int         lightCode  = 1;     // 0=Dark 1=Normal 2=Bright
+SystemState currentState   = STATE_WAITING;
+bool        connected      = false;
+
+/*************************************************************
+                     INTERNAL TIMERS
+*************************************************************/
+
+unsigned long lastPacketMs = 0;
+unsigned long lastBlinkMs  = 0;
+unsigned long lastVitalMs  = 0;
+
+SystemState   lastDrawnState     = STATE_BOOT;
+bool          lastDrawnConnected = false;
+
+/*************************************************************
+                     BLE CLIENT STATE
+*************************************************************/
+
+BLEScan*    bleScan          = nullptr;
+BLEClient*  bleClient        = nullptr;
+BLERemoteCharacteristic* bleDataChar = nullptr;
+
+bool        bleDeviceFound    = false;   // a matching advertisement was seen
+bool        bleShouldConnect  = false;   // main loop should attempt connect()
+bool        bleConnecting     = false;   // connect attempt in progress (re-entry guard)
+BLEAdvertisedDevice* targetDevice = nullptr;
+
+/*************************************************************
+              HELPER — state color & message
+*************************************************************/
+
+uint16_t stateColor(SystemState s)
+{
+    switch (s)
+    {
+        case STATE_HEALTHY:        return COLOR_HEALTHY;
+        case STATE_MONITORING:     return COLOR_MONITORING;
+        case STATE_MILD_FATIGUE:   return COLOR_MILD_FATIGUE;
+        case STATE_VISUAL_FATIGUE: return COLOR_VISUAL_FATIGUE;
+        case STATE_HIGH_STRESS:    return COLOR_HIGH_STRESS;
+        default:                   return COLOR_WAITING;
+    }
+}
+
+const char* stateMessage(SystemState s)
+{
+    switch (s)
+    {
+        case STATE_HEALTHY:        return "You're doing great!";
+        case STATE_MONITORING:     return "Monitoring...";
+        case STATE_MILD_FATIGUE:   return "Take a short break";
+        case STATE_VISUAL_FATIGUE: return "Rest your eyes";
+        case STATE_HIGH_STRESS:    return "You seem stressed";
+        default:                   return "Waiting for BASIRA";
+    }
+}
+
+/*************************************************************
+                      FACE ENGINE
+*************************************************************/
+
+void drawHead(uint16_t color)
+{
+    tft.fillCircle(FACE_X, FACE_Y, FACE_R, color);
+    tft.drawCircle(FACE_X, FACE_Y, FACE_R, TFT_WHITE);
+}
+
+void drawEyesHappy()
+{
+    tft.fillCircle(FACE_X - 28, FACE_Y - 20, 9, TFT_BLACK);
+    tft.fillCircle(FACE_X + 28, FACE_Y - 20, 9, TFT_BLACK);
+    tft.fillCircle(FACE_X - 25, FACE_Y - 23, 2, TFT_WHITE);
+    tft.fillCircle(FACE_X + 31, FACE_Y - 23, 2, TFT_WHITE);
+}
+
+void drawEyesNormal()
+{
+    tft.fillCircle(FACE_X - 28, FACE_Y - 20, 7, TFT_BLACK);
+    tft.fillCircle(FACE_X + 28, FACE_Y - 20, 7, TFT_BLACK);
+}
+
+void drawEyesSleepy()
+{
+    tft.fillCircle(FACE_X - 28, FACE_Y - 20, 7, TFT_BLACK);
+    tft.fillCircle(FACE_X + 28, FACE_Y - 20, 7, TFT_BLACK);
+    uint16_t lid = COLOR_VISUAL_FATIGUE;
+    for (int i = 0; i < 5; i++)
+    {
+        tft.drawFastHLine(FACE_X - 36, FACE_Y - 23 + i, 17, lid);
+        tft.drawFastHLine(FACE_X + 19, FACE_Y - 23 + i, 17, lid);
+    }
+}
+
+void drawEyesStress()
+{
+    tft.fillCircle(FACE_X - 28, FACE_Y - 20, 8, TFT_BLACK);
+    tft.fillCircle(FACE_X + 28, FACE_Y - 20, 8, TFT_BLACK);
+    tft.drawLine(FACE_X - 38, FACE_Y - 35, FACE_X - 18, FACE_Y - 28, TFT_BLACK);
+    tft.drawLine(FACE_X - 38, FACE_Y - 34, FACE_X - 18, FACE_Y - 27, TFT_BLACK);
+    tft.drawLine(FACE_X + 18, FACE_Y - 28, FACE_X + 38, FACE_Y - 35, TFT_BLACK);
+    tft.drawLine(FACE_X + 18, FACE_Y - 27, FACE_X + 38, FACE_Y - 34, TFT_BLACK);
+}
+
+void drawEyesWaiting()
+{
+    tft.drawCircle(FACE_X - 28, FACE_Y - 20, 8, TFT_BLACK);
+    tft.drawCircle(FACE_X + 28, FACE_Y - 20, 8, TFT_BLACK);
+}
+
+void drawEyesClosed(uint16_t faceColor)
+{
+    tft.fillCircle(FACE_X - 28, FACE_Y - 20, 10, faceColor);
+    tft.fillCircle(FACE_X + 28, FACE_Y - 20, 10, faceColor);
+    tft.drawFastHLine(FACE_X - 36, FACE_Y - 20, 17, TFT_BLACK);
+    tft.drawFastHLine(FACE_X + 19, FACE_Y - 20, 17, TFT_BLACK);
+}
+
+void drawSmile()
+{
+    tft.drawArc(FACE_X, FACE_Y + 22, 26, 21, 20, 160, TFT_BLACK, BG_COLOR);
+}
+
+void drawNeutral()
+{
+    tft.drawFastHLine(FACE_X - 18, FACE_Y + 28, 36, TFT_BLACK);
+    tft.drawFastHLine(FACE_X - 18, FACE_Y + 29, 36, TFT_BLACK);
+}
+
+void drawSad()
+{
+    tft.drawArc(FACE_X, FACE_Y + 48, 26, 21, 200, 340, TFT_BLACK, BG_COLOR);
+}
+
+void drawWorried()
+{
+    tft.drawArc(FACE_X, FACE_Y + 42, 20, 16, 210, 330, TFT_BLACK, BG_COLOR);
+}
+
+void drawStressMouth()
+{
+    for (int i = -18; i < 18; i += 6)
+    {
+        int y1 = (((i / 6) % 2) == 0) ? FACE_Y + 28 : FACE_Y + 32;
+        int y2 = (((i / 6) % 2) == 0) ? FACE_Y + 32 : FACE_Y + 28;
+        tft.drawLine(FACE_X + i, y1, FACE_X + i + 6, y2, TFT_BLACK);
+    }
+}
+
+void drawFace(SystemState s)
+{
+    uint16_t color = stateColor(s);
+    drawHead(color);
+
+    switch (s)
+    {
+        case STATE_HEALTHY:
+            drawEyesHappy();
+            drawSmile();
+            break;
+        case STATE_MONITORING:
+            drawEyesNormal();
+            drawNeutral();
+            break;
+        case STATE_MILD_FATIGUE:
+            drawEyesNormal();
+            drawSad();
+            break;
+        case STATE_VISUAL_FATIGUE:
+            drawEyesSleepy();
+            drawWorried();
+            break;
+        case STATE_HIGH_STRESS:
+            drawEyesStress();
+            drawStressMouth();
+            break;
+        default:
+            drawEyesWaiting();
+            drawNeutral();
+            break;
+    }
+}
+
+void animateBlink()
+{
+    if (millis() - lastBlinkMs < BLINK_INTERVAL_MS) return;
+    lastBlinkMs = millis();
+
+    drawEyesClosed(stateColor(currentState));
+    delay(BLINK_HOLD_MS);
+    drawFace(currentState);
+}
+
+/*************************************************************
+                    UI COMPONENTS
+*************************************************************/
+
+void drawPanel(int x, int y, int w, int h, uint16_t color)
+{
+    tft.fillRoundRect(x, y, w, h, 10, color);
+    tft.drawRoundRect(x, y, w, h, 10, TFT_WHITE);
+}
+
+void drawHeader()
+{
+    drawPanel(4, 4, 312, 50, DARK_BLUE);
+    tft.setTextColor(TFT_WHITE, DARK_BLUE);
+    tft.setTextSize(2);
+    tft.setTextDatum(ML_DATUM);
+    tft.drawString("BASAR", 16, 29);
+
+    tft.fillCircle(294, 29, 7, connected ? TFT_GREEN : TFT_RED);
+    tft.drawCircle(294, 29, 7, TFT_WHITE);
+    tft.setTextSize(1);
+    tft.setTextDatum(MR_DATUM);
+    tft.drawString(connected ? "Connected" : "Waiting", 282, 29);
+}
+
+void drawFooter()
+{
+    drawPanel(4, 442, 312, 34, DARK_BLUE);
+    tft.setTextColor(TFT_WHITE, DARK_BLUE);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(1);
+    tft.drawString("BASIRA Smart Glasses", 160, 459);
+}
+
+void drawMessage()
+{
+    uint16_t accent = stateColor(currentState);
+    tft.fillRoundRect(18, 238, 284, 82, 12, accent);
+    tft.fillRoundRect(20, 240, 280, 78, 10, PANEL_COLOR);
+    tft.drawRoundRect(20, 240, 280, 78, 10, accent);
+    tft.setTextColor(TFT_WHITE, PANEL_COLOR);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextSize(2);
+    tft.drawString(stateMessage(currentState), 160, 279);
+    tft.setTextSize(1);
+}
+
+void drawCard(int x, int y, int w, int h,
+              const char* title, const String &value,
+              uint16_t accent)
+{
+    drawPanel(x, y, w, h, CARD_COLOR);
+    tft.fillRoundRect(x, y, 5, h, 4, accent);
+    tft.setTextColor(0xC618, CARD_COLOR);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextSize(1);
+    tft.drawString(title, x + 12, y + 8);
+    tft.setTextColor(TFT_WHITE, CARD_COLOR);
+    tft.drawString(value, x + 12, y + 26);
+}
+
+void drawVitals()
+{
+    uint16_t accent = stateColor(currentState);
+
+    drawCard(6,   332, 150, 58, "HEART RATE",
+             String(heartRate, 1) + " BPM", accent);
+
+    drawCard(164, 332, 150, 58, "BLINK RATE",
+             String(blinkRate, 1) + "/min", accent);
+
+    const char* gsrLabel  = (gsrRaw > 550) ? "HIGH" : "NORMAL";
+    drawCard(6,   396, 150, 42, "STRESS", String(gsrLabel), accent);
+
+    const char* lightLabel;
+    if      (lightCode == 0) lightLabel = "DARK";
+    else if (lightCode == 2) lightLabel = "BRIGHT";
+    else                     lightLabel = "NORMAL";
+    drawCard(164, 396, 150, 42, "LIGHT", String(lightLabel), accent);
+}
+
+void drawLayout()
+{
+    tft.fillScreen(BG_COLOR);
+    drawHeader();
+    drawFooter();
+    drawFace(currentState);
+    drawMessage();
+    drawVitals();
+}
+
+/*************************************************************
+                   SPLASH SCREEN
+*************************************************************/
+
+void splashScreen()
+{
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(MC_DATUM);
+
+    tft.setTextColor(BASAR_BLUE);
+    tft.setTextSize(3);
+    tft.drawString("BASAR", 160, 100);
+    delay(800);
+
+    tft.setTextColor(TFT_WHITE);
+    tft.setTextSize(2);
+    tft.drawString("Hello!", 160, 175);
+    delay(900);
+
+    tft.drawString("I'm Basar", 160, 215);
+    delay(900);
+
+    tft.setTextColor(BASAR_BLUE);
+    tft.drawString("Here for you", 160, 255);
+    delay(1200);
+
+    tft.fillCircle(160, 355, 55, BASAR_BLUE);
+    tft.drawCircle(160, 355, 55, TFT_WHITE);
+    tft.fillCircle(132, 338, 7, TFT_BLACK);
+    tft.fillCircle(188, 338, 7, TFT_BLACK);
+    tft.drawArc(160, 372, 22, 17, 20, 160, TFT_BLACK, BG_COLOR);
+    delay(1200);
+
+    tft.fillScreen(TFT_BLACK);
+    delay(200);
+}
+
+/*************************************************************
+               DASHBOARD UPDATE
+*************************************************************/
+
+void updateDashboard()
+{
+    bool stateChanged     = (currentState != lastDrawnState);
+    bool connectedChanged = (connected    != lastDrawnConnected);
+
+    if (stateChanged || connectedChanged)
+    {
+        lastDrawnState     = currentState;
+        lastDrawnConnected = connected;
+        drawLayout();
+        return;
+    }
+
+    if (millis() - lastVitalMs >= 500)
+    {
+        lastVitalMs = millis();
+        drawVitals();
+    }
+}
+
+/*************************************************************
+              BLE → DASHBOARD STATE MAPPING
+*************************************************************/
+
+SystemState mapProtocolState(uint8_t s)
+{
+    switch (s)
+    {
+        case BSTATE_HEALTHY:        return STATE_HEALTHY;
+        case BSTATE_MONITORING:     return STATE_MONITORING;
+        case BSTATE_MILD_FATIGUE:   return STATE_MILD_FATIGUE;
+        case BSTATE_VISUAL_FATIGUE: return STATE_VISUAL_FATIGUE;
+        case BSTATE_HIGH_STRESS:    return STATE_HIGH_STRESS;
+        // STARTUP / CALIBRATION on the glasses side both show as "waiting" here —
+        // intentional: the desktop has nothing useful to plot yet during either.
+        default:                    return STATE_WAITING;
+    }
+}
+
+int mapProtocolLight(uint8_t l)
+{
+    switch (l)
+    {
+        case BLIGHT_DARK:   return 0;
+        case BLIGHT_BRIGHT: return 2;
+        default:             return 1; // NORMAL and UNKNOWN both display as NORMAL
+    }
+}
+
+/*************************************************************
+         BLE NOTIFY CALLBACK — fires on every packet
+*************************************************************/
+
+void onPacketNotify(BLERemoteCharacteristic* characteristic,
+                     uint8_t* data, size_t length, bool isNotify)
+{
+    if (length != sizeof(BasiraPacket))
+    {
+        // Defensive: a malformed/short packet must never be cast onto the struct —
+        // doing so would read past the buffer or misinterpret bytes as the wrong
+        // field. Drop it and wait for the next one instead.
+        return;
+    }
+
+    BasiraPacket packet;
+    memcpy(&packet, data, sizeof(BasiraPacket));
+
+    heartRate    = packet.heartRateBpm;
+    blinkRate    = packet.blinkRatePerMin;
+    hrv          = packet.hrv;
+    gsrRaw       = packet.gsrFiltered;
+    lightCode    = mapProtocolLight(packet.lightState);
+    currentState = mapProtocolState(packet.systemState);
+
+    connected    = true;
+    lastPacketMs = millis();
+}
+
+/*************************************************************
+         BLE SCAN CALLBACK — looks for "BASIRA"
+*************************************************************/
+
+class BasiraAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks
+{
+    void onResult(BLEAdvertisedDevice advertisedDevice) override
+    {
+        if (!advertisedDevice.haveServiceUUID()) return;
+        if (!advertisedDevice.isAdvertisingService(BLEUUID(BASIRA_SERVICE_UUID))) return;
+
+        advertisedDevice.getScan()->stop();
+
+        if (targetDevice != nullptr) { delete targetDevice; targetDevice = nullptr; }
+        targetDevice = new BLEAdvertisedDevice(advertisedDevice);
+
+        bleDeviceFound   = true;
+        bleShouldConnect = true;
+    }
+};
+
+/*************************************************************
+         BLE CLIENT CONNECT CALLBACK — tracks link drop
+*************************************************************/
+
+class BasiraClientCallbacks : public BLEClientCallbacks
+{
+    void onConnect(BLEClient* client) override
+    {
+        // Handled after connect() returns in connectToServer(); nothing needed here.
+    }
+
+    void onDisconnect(BLEClient* client) override
+    {
+        connected = false;
+        currentState = STATE_WAITING;
+        bleDataChar = nullptr;
+        // Resume scanning so the desktop reconnects automatically once the
+        // glasses are back in range — no manual reset required.
+        bleScan->start(BLE_RECONNECT_SCAN_MS, false);
+    }
+};
+
+/*************************************************************
+         BLE CONNECT ROUTINE
+*************************************************************/
+
+bool connectToServer()
+{
+    bleClient = BLEDevice::createClient();
+    bleClient->setClientCallbacks(new BasiraClientCallbacks());
+
+    if (!bleClient->connect(targetDevice))
+    {
+        return false;
+    }
+
+    BLERemoteService* remoteService = bleClient->getService(BASIRA_SERVICE_UUID);
+    if (remoteService == nullptr)
+    {
+        bleClient->disconnect();
+        return false;
+    }
+
+    bleDataChar = remoteService->getCharacteristic(BASIRA_CHAR_DATA_UUID);
+    if (bleDataChar == nullptr)
+    {
+        bleClient->disconnect();
+        return false;
+    }
+
+    if (bleDataChar->canNotify())
+    {
+        bleDataChar->registerForNotify(onPacketNotify);
+    }
+
+    connected    = true;
+    lastPacketMs = millis();
+    return true;
+}
+
+void initializeBLE()
+{
+    BLEDevice::init("");
+
+    bleScan = BLEDevice::getScan();
+    bleScan->setAdvertisedDeviceCallbacks(new BasiraAdvertisedDeviceCallbacks());
+    bleScan->setInterval(100);
+    bleScan->setWindow(99);
+    bleScan->setActiveScan(true);
+    bleScan->start(BLE_RECONNECT_SCAN_MS, false);
+}
+
+void serviceBLEConnection()
+{
+    if (bleShouldConnect)
+    {
+        bleShouldConnect = false;
+        if (!connectToServer())
+        {
+            // Connection attempt failed — go back to scanning rather than
+            // getting stuck. Common causes: glasses rebooted mid-handshake,
+            // or another central briefly grabbed the slot first.
+            bleScan->start(BLE_RECONNECT_SCAN_MS, false);
+        }
+    }
+
+    // Link-loss watchdog: if no packet has arrived recently even though we
+    // think we're connected, treat it as dead. BLE disconnect callbacks are
+    // usually reliable, but a stalled link without a clean disconnect event
+    // is possible (e.g. the glasses lost power abruptly) — this catches that.
+    if (connected && (millis() - lastPacketMs > BLE_LINK_TIMEOUT_MS))
+    {
+        connected    = false;
+        currentState = STATE_WAITING;
+        if (bleClient != nullptr && bleClient->isConnected())
+        {
+            bleClient->disconnect(); // triggers onDisconnect → resumes scanning
+        }
+        else
+        {
+            bleScan->start(BLE_RECONNECT_SCAN_MS, false);
+        }
+    }
+}
+
+/*************************************************************
+                       SETUP
+*************************************************************/
+
+void setup()
+{
+    Serial.begin(115200);
+
+    tft.init();
+    tft.setRotation(0);
+    tft.fillScreen(BG_COLOR);
+    tft.setTextWrap(false);
+
+    splashScreen();
+
+    currentState = STATE_WAITING;
+    connected    = false;
+
+    drawLayout();
+
+    initializeBLE();
+}
+
+/*************************************************************
+                        LOOP
+*************************************************************/
+
+void loop()
+{
+    serviceBLEConnection();
+    updateDashboard();
+    animateBlink();
+}
