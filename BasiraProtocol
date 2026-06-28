@@ -1,26 +1,28 @@
 /******************************************************************************************
  *
- *  BasiraProtocol.h
+ *  BasiraProtocol.h  —  v3.3.0
  *  Shared BLE contract between BASIRA glasses (server) and BASAR desktop (client).
  *
- *  COPY THIS EXACT FILE INTO BOTH PROJECT FOLDERS — do not retype it on either side.
- *  If the struct ever changes, change it here once and recopy to both. A field-order
- *  or type mismatch between the two copies will desync every reading after the first
- *  divergent field, with no compile-time warning.
+ *  COPY THIS EXACT FILE INTO BOTH PROJECT FOLDERS.
+ *  Any field-order or type mismatch between the two copies will silently corrupt
+ *  every field after the divergent one. The static_assert at the bottom is your
+ *  compile-time guard — if it fails, both firmwares must be rebuilt together.
+ *
+ *  Changelog v3.2:
+ *    - No struct changes from v3.1 (still 28 bytes)
+ *    - File kept identical to ensure both sides always compile from same source
+ *
+ *  Changelog v3.1:
+ *    - Added float perclos to BasiraPacket (PERCLOS: % eye closure over 1-min window)
+ *    - Struct size: 24 → 28 bytes
  *
  ******************************************************************************************/
-
 #pragma once
 
-// ---- BLE identifiers --------------------------------------------------
-// Randomly generated UUIDs for this project. Keep identical on both ends.
-#define BASIRA_SERVICE_UUID         "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
-#define BASIRA_CHAR_DATA_UUID       "6e400002-b5a3-f393-e0a9-e50e24dcca9e" // Notify: sensor packet
-#define BASIRA_DEVICE_NAME          "BASIRA"
+#define BASIRA_SERVICE_UUID     "6e400001-b5a3-f393-e0a9-e50e24dcca9e"
+#define BASIRA_CHAR_DATA_UUID   "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
+#define BASIRA_DEVICE_NAME      "BASIRA"
 
-// ---- System state enum (shared numeric encoding) ----------------------
-// Sent as a single uint8_t inside the packet. Both sides must map the same
-// numbers to the same meanings.
 enum BasiraSystemState : uint8_t
 {
     BSTATE_STARTUP        = 0,
@@ -32,7 +34,6 @@ enum BasiraSystemState : uint8_t
     BSTATE_HIGH_STRESS    = 6
 };
 
-// ---- Light state enum ---------------------------------------------------
 enum BasiraLightState : uint8_t
 {
     BLIGHT_UNKNOWN = 0,
@@ -41,27 +42,27 @@ enum BasiraLightState : uint8_t
     BLIGHT_BRIGHT  = 3
 };
 
-// ---- Wire packet ----------------------------------------------------------
-// pack(1): forces the compiler to use exact byte offsets with NO padding
-// between members on either chip. Without this, the ESP32-C3 and the
-// ESP32 DevKit toolchains are NOT guaranteed to align floats/structs the
-// same way, and the decoded values on the display would be garbage.
-#pragma pack(push, 1)
+#pragma pack(push,1)
+
 struct BasiraPacket
 {
-    uint32_t seq;             // increments every packet; lets the client detect drops
-    float    heartRateBpm;    // averaged BPM, 0 if off-skin
-    float    blinkRatePerMin; // blinks/min, 0 if window not ready yet
-    float    hrv;             // ms, mean successive RR difference
-    int16_t  gsrFiltered;     // filtered GSR reading
-    int16_t  gsrDelta;        // filtered - baseline
-    uint8_t  lightState;      // BasiraLightState
-    uint8_t  systemState;     // BasiraSystemState
-    uint8_t  onSkin;          // 0/1 — heart sensor contact
-    uint8_t  vibrating;       // 0/1 — motor currently pulsing (telemetry only)
+    uint32_t seq;
+
+    float heartRateBpm;
+    float blinkRatePerMin;
+    float hrv;
+    float perclos;
+
+    int16_t gsrFiltered;
+    int16_t gsrDelta;
+
+    uint8_t lightState;
+    uint8_t systemState;
+    uint8_t onSkin;
+    uint8_t vibrating;
 };
+
 #pragma pack(pop)
 
-// Compile-time guard: if this ever fails to compile, the two sides'
-// toolchains disagree about struct size and you MUST NOT trust the data.
-static_assert(sizeof(BasiraPacket) == 24, "BasiraPacket size changed — update both firmwares together");
+static_assert(sizeof(BasiraPacket) == 28,
+              "BasiraPacket size mismatch");
