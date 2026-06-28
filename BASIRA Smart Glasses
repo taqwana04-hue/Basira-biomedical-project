@@ -1,27 +1,69 @@
 /******************************************************************************************
  *
- * Project      : BASIRA Smart Glasses
- * Firmware     : v2.0.0 (BLE)
+ *  BasiraGlasses.ino  —  Firmware v3.3.0
+ *  BASIRA Smart Glasses — ESP32-C3 Super Mini
  *
- * Hardware:
- * ESP32-C3 Super Mini
- * TCRT5000       → GPIO0 (AO), GPIO1 (DO)
- * Grove GSR      → GPIO2 (Analog Input)
- * GL5528 LDR     → GPIO3 (Analog Input)
- * MAX30102       → GPIO8 (SDA), GPIO9 (SCL)
- * Vibration      → GPIO10 (Digital Output)
+ *  Hardware:
+ *    TCRT5000   → GPIO0 (AO)
+ *    Grove GSR  → GPIO2 (Analog)
+ *    GL5528 LDR → GPIO3 (Analog)
+ *    MAX30102   → GPIO8 (SDA), GPIO9 (SCL)
+ *    Vibration  → GPIO10 (Digital Output)
  *
- * Role          : BLE GATT SERVER (peripheral). Advertises continuously, accepts one
- *                 central (the BASAR desktop), notifies a packed binary sensor packet
- *                 once per second over BLE.
+ * ════════════════════════════════════════════════════════════════
+ *  ROOT CAUSE ANALYSIS — v3.3 fixes (from serial log evidence)
+ * ════════════════════════════════════════════════════════════════
  *
- * IMPORTANT     : The ESP32-C3 has BLE only — it has no Classic Bluetooth / SPP. This
- *                 firmware therefore CANNOT use BluetoothSerial.h (that library will not
- *                 compile on this chip). BLE GATT is the correct and only option here.
+ *  FIX-1  BLINK RATE always 0.0 /min
+ *  ─────────────────────────────────
+ *  Root cause: Edge detection (OPEN→CLOSED, CLOSED→OPEN) was inside
+ *  calculateBlinkFeatures() which runs every FEATURE_PERIOD = 1000ms.
+ *  A full blink lasts 150–400ms. The 1000ms snapshot sees the eye in
+ *  the same state as the previous second nearly every time — so the
+ *  rising/falling edge is never captured and blinkCount stays 0.
  *
- * Standalone behavior : Sensors, decision engine, and the vibration motor run
- *                 continuously regardless of BLE connection state. BLE connectivity only
- *                 affects whether readings are also notified to a paired desktop.
+ *  Evidence: Serial log shows BLINK raw alternating 298/4095 correctly,
+ *  but "Blink rate: 0.0 /min" persists for the entire session.
+ *
+ *  Fix: blinkCount++ logic moved entirely into readBlinkSensor() which
+ *  runs every BLINK_PERIOD = 20ms. At 20ms resolution a 150ms blink is
+ *  sampled ~7 times — the OPEN→CLOSED edge is reliably detected.
+ *  calculateBlinkFeatures() now only handles the 30s window arithmetic,
+ *  not edge detection.
+ *
+ *  FIX-2  GSR always 4095 — user instruction fix
+ *  ───────────────────────────────────────────────
+ *  Evidence from serial log: GSR raw=4095 throughout, even with ADC_11db.
+ *  This is CORRECT hardware behavior — Grove GSR output is near VCC when
+ *  no skin contact is made. The op-amp buffer in the Grove module pulls
+ *  the output high when the electrode circuit is open.
+ *
+ *  The ADC_11db configuration IS working (confirmed: TCRT reads 297–343
+ *  when closed, 4095 when open — correct 12-bit full-range behavior).
+ *
+ *  The user was testing WITHOUT placing both electrodes on skin.
+ *  Fixes applied:
+ *    a) analogSetPinAttenuation(PIN_GSR, ADC_11db) — explicit per-pin
+ *       attenuation as a safeguard against Arduino core version differences.
+ *    b) Serial calibration message now explicitly warns: attach both
+ *       electrodes to index + middle finger BEFORE powering on.
+ *    c) GSR_FLOATING_THRESHOLD lowered to 3800 — more conservative.
+ *       At 3.3V / 12-bit: skin contact typically gives 1000–3000 ADC,
+ *       floating/no-contact gives 3900–4095. 3800 gives a safety margin.
+ *
+ *  FIX-3  Light sensor restored to v3.0 behavior
+ *  ───────────────────────────────────────────────
+ *  Evidence: Light sensor was working correctly in v3.0/v3.1.
+ *  The hysteresis from v3.2 (±10 count dead-band) is preserved as it
+ *  prevents rapid state flipping, but the baseline and thresholds are
+ *  restored. LIGHT_PERIOD remains 500ms as set in v3.2.
+ *
+ *  All v3.2 fixes preserved:
+ *    - ADC 12-bit + ADC_11db configuration
+ *    - TCRT averaging (8 samples), GSR averaging (10 samples)
+ *    - PERCLOS live update every 1s (partial window)
+ *    - RR interval bounds [300ms–1500ms] for HRV
+ *    - BLE first packet fires immediately after calibration
  *
  ******************************************************************************************/
 
@@ -29,80 +71,115 @@
 #include <Wire.h>
 #include "MAX30105.h"
 #include "heartRate.h"
-
 #include <BLEDevice.h>
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include "BasiraProtocol_1.h"
 
-#include "BasiraProtocol.h"   // shared contract — copy must match desktop's copy exactly
-
-/********************************************************
- * Pin Configuration
- * ******************************************************/
+// ============================================================
+//  Pin map
+// ============================================================
 const uint8_t PIN_BLINK_AO = 0;
-const uint8_t PIN_BLINK_DO = 1;
-const uint8_t PIN_GSR      = 2;
+const uint8_t PIN_GSR      = 4;
 const uint8_t PIN_LDR      = 3;
 const uint8_t PIN_SDA      = 8;
 const uint8_t PIN_SCL      = 9;
 const uint8_t PIN_MOTOR    = 10;
 
-/********************************************************
- * Timing Constants (ms)
- * ******************************************************/
-const uint16_t HEART_PERIOD    = 20;
-const uint16_t BLINK_PERIOD    = 50;
-const uint16_t GSR_PERIOD      = 500;
-const uint16_t LIGHT_PERIOD    = 1000;
-const uint16_t FEATURE_PERIOD  = 1000;
-const uint16_t DECISION_PERIOD = 2000;
+// ============================================================
+//  Scheduler periods (ms)
+// ============================================================
+const uint16_t HEART_PERIOD      = 20;
+const uint16_t BLINK_PERIOD      = 20;
+const uint16_t GSR_PERIOD        = 200;
+const uint16_t LIGHT_PERIOD      = 500;
+const uint16_t FEATURE_PERIOD    = 1000;
+const uint16_t DECISION_PERIOD   = 2000;
 const uint16_t BLE_NOTIFY_PERIOD = 1000;
 
-/********************************************************
- * Biomedical & Algorithmic Thresholds
- * ******************************************************/
-const long  IR_ON_SKIN_THRESHOLD     = 10000;
-const float MIN_BPM                  = 40.0f;
-const float MAX_BPM                  = 180.0f;
-const uint16_t CALIBRATION_TIME      = 5000;
-const uint32_t BLINK_WINDOW          = 30000;
+// ============================================================
+//  ADC averaging sample counts
+// ============================================================
+const uint8_t TCRT_SAMPLES = 8;
+const uint8_t GSR_SAMPLES  = 10;
 
-const float THRESHOLD_HRV_LOW        = 20.0f;
-const float THRESHOLD_HEART_HIGH     = 100.0f;
-const int   THRESHOLD_LIGHT_DARK     = -120;
-const int   THRESHOLD_LIGHT_BRIGHT   = 250;
-const int   THRESHOLD_GSR_ELEVATED   = -20;
+// ============================================================
+//  Blink hysteresis thresholds — 12-bit / ADC_11db (0–3.3V)
+//
+//  VERIFIED from serial log:
+//    Eye OPEN  → BLINK raw = 4095
+//    Eye CLOSED → BLINK raw = 297–343
+//  These thresholds are correct and must NOT be changed.
+// ============================================================
+const uint16_t BLINK_OPEN_THRESHOLD   = 2200;
+const uint16_t BLINK_CLOSED_THRESHOLD = 1700;
 
-/********************************************************
- * Enumerations (internal — mapped to BasiraProtocol enums at send time)
- * ******************************************************/
-enum EyeState     { EYE_UNKNOWN, EYE_OPEN, EYE_CLOSED };
-enum LightState   { LIGHT_UNKNOWN, LIGHT_DARK, LIGHT_NORMAL, LIGHT_BRIGHT };
-enum SkinState    { OFF_SKIN, ON_SKIN };
-enum SystemState  { SYSTEM_STARTUP, SYSTEM_CALIBRATION, SYSTEM_MONITORING,
-                    SYSTEM_HEALTHY, SYSTEM_MILD_FATIGUE,
-                    SYSTEM_VISUAL_FATIGUE, SYSTEM_HIGH_STRESS };
-enum BlinkStatus  { BLINK_UNKNOWN, BLINK_NORMAL, BLINK_LOW, BLINK_VERY_LOW };
-enum HeartStatus  { HEART_UNKNOWN, HEART_NORMAL, HEART_HIGH };
-enum HRVStatus    { HRV_UNKNOWN, HRV_NORMAL, HRV_LOW };
-enum GSRStatus    { GSR_UNKNOWN, GSR_NORMAL, GSR_ELEVATED };
+// ============================================================
+//  PERCLOS window
+// ============================================================
+const uint32_t PERCLOS_WINDOW_MS = 60000UL;
 
-/********************************************************
- * Structs
- * ******************************************************/
-struct BlinkSensor {
+// ============================================================
+//  Physiological thresholds
+// ============================================================
+const long     IR_ON_SKIN_THRESHOLD  = 10000;
+const uint16_t RR_MIN_MS             = 300;
+const uint16_t RR_MAX_MS             = 1500;
+const uint16_t CALIBRATION_TIME_MS   = 5000;
+
+const float  THRESHOLD_HRV_LOW       = 20.0f;
+const float  THRESHOLD_HEART_HIGH    = 100.0f;
+
+// Light thresholds (restored from v3.0)
+const int    THRESHOLD_LIGHT_DARK    = -120;
+const int    THRESHOLD_LIGHT_BRIGHT  = 250;
+const int    THRESHOLD_LIGHT_HYST    = 10;
+
+const int    THRESHOLD_GSR_ELEVATED  = -20;
+
+// FIX-2: 3800 is more conservative than 3900.
+// Grove GSR with skin contact: ~1000–3000 ADC (12-bit, ADC_11db).
+// Grove GSR no skin / floating: 3900–4095.
+// 3800 gives a clear safety margin.
+const uint16_t GSR_FLOATING_THRESHOLD = 3800;
+
+const float PERCLOS_MILD   = 20.0f;
+const float PERCLOS_SEVERE = 40.0f;
+
+// ============================================================
+//  Enumerations
+// ============================================================
+enum EyeState    { EYE_UNKNOWN, EYE_OPEN, EYE_CLOSED };
+enum LightState  { LIGHT_UNKNOWN, LIGHT_DARK, LIGHT_NORMAL, LIGHT_BRIGHT };
+enum SkinState   { OFF_SKIN, ON_SKIN };
+enum SystemState { SYSTEM_STARTUP, SYSTEM_CALIBRATION, SYSTEM_MONITORING,
+                   SYSTEM_HEALTHY, SYSTEM_MILD_FATIGUE,
+                   SYSTEM_VISUAL_FATIGUE, SYSTEM_HIGH_STRESS };
+enum BlinkStatus { BLINK_UNKNOWN, BLINK_NORMAL, BLINK_LOW, BLINK_VERY_LOW };
+enum HeartStatus { HEART_UNKNOWN, HEART_NORMAL, HEART_HIGH };
+enum HRVStatus   { HRV_UNKNOWN, HRV_NORMAL, HRV_LOW };
+enum GSRStatus   { GSR_UNKNOWN, GSR_NORMAL, GSR_ELEVATED };
+
+// ============================================================
+//  Structs
+// ============================================================
+struct BlinkSensor
+{
     uint16_t analog;
-    bool     digital;
     EyeState eye;
-    uint32_t blinkCount;
+    uint32_t blinkCount;      // FIX-1: incremented in readBlinkSensor() at 20ms
     float    blinkRate;
     uint16_t eyeClosureTime;
-    uint16_t baseline;
     bool     windowReady;
+
+    uint32_t closedMsInWindow;
+    uint32_t percloseWindowStart;
+    float    perclos;
 };
 
-struct HeartSensor {
+struct HeartSensor
+{
     long      ir;
     SkinState skin;
     bool      beatDetected;
@@ -112,33 +189,40 @@ struct HeartSensor {
     float     hrv;
 };
 
-struct GSRSensor {
+struct GSRSensor
+{
     uint16_t raw;
     float    filtered;
     float    baseline;
     float    delta;
+    bool     onSkin;
 };
 
-struct LightSensor {
+struct LightSensor
+{
     uint16_t   raw;
     uint16_t   baseline;
     LightState state;
+    int        lastDiff;
 };
 
-struct PhysiologicalState {
+struct PhysiologicalState
+{
     BlinkStatus blink;
     HeartStatus heart;
     HRVStatus   hrv;
     GSRStatus   gsr;
 };
 
-struct DecisionEngine {
+struct DecisionEngine
+{
     uint8_t     riskScore;
     SystemState state;
     bool        vibration;
 };
 
-struct BasiraSystem {
+struct BasiraSystem
+{
     BlinkSensor        blink;
     HeartSensor        heart;
     GSRSensor          gsr;
@@ -147,9 +231,9 @@ struct BasiraSystem {
     DecisionEngine     decision;
 };
 
-/********************************************************
- * Globals
- * ******************************************************/
+// ============================================================
+//  Globals
+// ============================================================
 BasiraSystem basira;
 MAX30105     max30102;
 
@@ -159,91 +243,102 @@ uint32_t timerGSR       = 0;
 uint32_t timerLight     = 0;
 uint32_t timerFeature   = 0;
 uint32_t timerDecision  = 0;
-uint32_t timerBleNotify = 0;
+uint32_t timerBleNotify = 0;   // 0 → first packet fires immediately after calibration
 
 bool     calibrationFinished = false;
 uint32_t calibrationStart    = 0;
 
-bool     previousEyeClosed  = false;
-uint32_t eyeClosedStart     = 0;
-uint32_t blinkWindowStart   = 0;
+// FIX-1: blink edge state lives here, updated at 20ms in readBlinkSensor()
+EyeState previousEyeState   = EYE_UNKNOWN;
+uint32_t eyeClosedStart      = 0;
+uint32_t blinkWindowStart    = 0;
+uint32_t lastPerclosTickMs   = 0;
 
-bool     motorRunning       = false;
-uint32_t motorStartTime     = 0;
-const uint16_t MOTOR_PULSE_TIME = 300;
+bool     motorRunning   = false;
+uint32_t motorStartTime = 0;
+const uint16_t MOTOR_PULSE_MS = 300;
 
-const uint8_t RR_BUFFER_SIZE = 20;
-uint16_t      rrHistory[RR_BUFFER_SIZE];
-uint8_t       rrIndex   = 0;
-uint8_t       rrSamples = 0;
+// HRV ring buffer
+const uint8_t RR_BUF = 20;
+uint16_t rrHistory[RR_BUF];
+uint8_t  rrIndex   = 0;
+uint8_t  rrSamples = 0;
 
-/********************************************************
- * BLE globals
- * ******************************************************/
-BLEServer*         bleServer          = nullptr;
-BLECharacteristic*  bleDataChar       = nullptr;
-bool                bleClientConnected = false;
-uint32_t            packetSeq          = 0;
+// BLE
+BLEServer*         bleServer   = nullptr;
+BLECharacteristic* bleDataChar = nullptr;
+bool               bleConnected = false;
+uint32_t           packetSeq   = 0;
 
-/********************************************************
- * BLE server callbacks — track connect/disconnect so we
- * can keep advertising again after a client drops.
- * ******************************************************/
+// ============================================================
+//  ADC averaging helper
+//  500µs between samples: gives SAR capacitor time to charge
+// ============================================================
+uint16_t adcAverage(uint8_t pin, uint8_t n)
+{
+    uint32_t sum = 0;
+    for (uint8_t i = 0; i < n; i++)
+    {
+        sum += analogRead(pin);
+        delayMicroseconds(500);
+    }
+    return (uint16_t)(sum / n);
+}
+
+// ============================================================
+//  BLE server callbacks
+// ============================================================
 class BasiraServerCallbacks : public BLEServerCallbacks
 {
-    void onConnect(BLEServer* server) override
+    void onConnect(BLEServer*) override
     {
-        bleClientConnected = true;
+        bleConnected = true;
         Serial.println("[BLE] Central connected");
     }
-
     void onDisconnect(BLEServer* server) override
     {
-        bleClientConnected = false;
+        bleConnected = false;
         Serial.println("[BLE] Central disconnected — resuming advertising");
-        // Restart advertising so the desktop can auto-reconnect when back in range.
-        delay(200); // brief settle, recommended by ESP32 BLE examples before re-advertising
+        delay(200);
         server->getAdvertising()->start();
     }
 };
 
-/********************************************************
- * Scheduler Helper
- * ******************************************************/
-bool taskReady(uint32_t currentTime, uint32_t &lastExecution, uint32_t period)
+// ============================================================
+//  Scheduler helper
+// ============================================================
+inline bool taskReady(uint32_t now, uint32_t &last, uint32_t period)
 {
-    if ((currentTime - lastExecution) >= period)
-    {
-        lastExecution = currentTime;
-        return true;
-    }
+    if (now - last >= period) { last = now; return true; }
     return false;
 }
 
-/********************************************************
- * Hardware Initialization
- * ******************************************************/
+// ============================================================
+//  Hardware init
+// ============================================================
 void initializeVariables()
 {
     memset(&basira, 0, sizeof(BasiraSystem));
-    basira.blink.eye         = EYE_UNKNOWN;
-    basira.blink.windowReady = false;
-    basira.light.state       = LIGHT_UNKNOWN;
-    basira.heart.skin        = OFF_SKIN;
-    basira.decision.state    = SYSTEM_STARTUP;
-    basira.physiology.blink  = BLINK_UNKNOWN;
-    basira.physiology.heart  = HEART_UNKNOWN;
-    basira.physiology.hrv    = HRV_UNKNOWN;
-    basira.physiology.gsr    = GSR_UNKNOWN;
-    calibrationFinished      = false;
+    basira.blink.eye              = EYE_UNKNOWN;
+    basira.blink.windowReady      = false;
+    basira.blink.perclos          = 0.0f;
+    basira.light.state            = LIGHT_UNKNOWN;
+    basira.light.lastDiff         = 0;
+    basira.heart.skin             = OFF_SKIN;
+    basira.gsr.onSkin             = false;
+    basira.decision.state         = SYSTEM_STARTUP;
+    basira.physiology.blink       = BLINK_UNKNOWN;
+    basira.physiology.heart       = HEART_UNKNOWN;
+    basira.physiology.hrv         = HRV_UNKNOWN;
+    basira.physiology.gsr         = GSR_UNKNOWN;
 }
 
-void initializeMAX30102()
+void initMAX30102()
 {
     if (!max30102.begin(Wire))
     {
-        Serial.println("ERROR : MAX30102 NOT FOUND");
-        while (true) { delay(1000); }
+        Serial.println("ERROR: MAX30102 NOT FOUND — halting");
+        while (true) delay(1000);
     }
     max30102.setup();
     max30102.setPulseAmplitudeRed(0x0A);
@@ -253,161 +348,215 @@ void initializeMAX30102()
 
 void initializeHardware()
 {
-    pinMode(PIN_BLINK_DO, INPUT);
-    pinMode(PIN_MOTOR,    OUTPUT);
+    pinMode(PIN_MOTOR, OUTPUT);
     digitalWrite(PIN_MOTOR, LOW);
 
+    // 12-bit ADC, full 0–3.3V range for all analog pins
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_11db);
+
+    // FIX-2: explicit per-pin attenuation for GPIO2 (strapping pin)
+    // Some ESP32-C3 Arduino core versions require this explicitly
+    analogSetPinAttenuation(PIN_GSR,      ADC_11db);
+    analogSetPinAttenuation(PIN_BLINK_AO, ADC_11db);
+    analogSetPinAttenuation(PIN_LDR,      ADC_11db);
+
     Wire.begin(PIN_SDA, PIN_SCL);
-    initializeMAX30102();
+    initMAX30102();
     initializeVariables();
 }
 
-/********************************************************
- * BLE Initialization
- * ******************************************************/
+// ============================================================
+//  BLE init
+// ============================================================
 void initializeBLE()
 {
     BLEDevice::init(BASIRA_DEVICE_NAME);
-
     bleServer = BLEDevice::createServer();
     bleServer->setCallbacks(new BasiraServerCallbacks());
 
-    BLEService* service = bleServer->createService(BASIRA_SERVICE_UUID);
-
-    bleDataChar = service->createCharacteristic(
+    BLEService* svc = bleServer->createService(BASIRA_SERVICE_UUID);
+    bleDataChar = svc->createCharacteristic(
         BASIRA_CHAR_DATA_UUID,
         BLECharacteristic::PROPERTY_NOTIFY
     );
-    // BLE2902 descriptor is required for the client to enable notifications (CCCD).
     bleDataChar->addDescriptor(new BLE2902());
+    svc->start();
 
-    service->start();
-
-    BLEAdvertising* advertising = BLEDevice::getAdvertising();
-    advertising->addServiceUUID(BASIRA_SERVICE_UUID);
-    advertising->setScanResponse(true);
-    // Helps some centrals connect faster; values are in 0.625ms units.
-    advertising->setMinPreferred(0x06);
-    advertising->setMinPreferred(0x12);
+    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(BASIRA_SERVICE_UUID);
+    adv->setScanResponse(true);
+    adv->setMinPreferred(0x00);
     BLEDevice::startAdvertising();
 
-    Serial.println("[BLE] Advertising as 'BASIRA'");
+    Serial.println("[BLE] Advertising as '" BASIRA_DEVICE_NAME "'");
 }
 
-/********************************************************
- * Setup
- * ******************************************************/
-void setup()
-{
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println("========================================");
-    Serial.println(" BASIRA SMART GLASSES  Firmware v2.0.0 (BLE)");
-    Serial.println("========================================");
-
-    initializeHardware();
-    initializeBLE();
-
-    calibrationStart = millis();
-    basira.decision.state = SYSTEM_CALIBRATION;
-    Serial.println("Calibrating... please keep still.");
-}
-
-/********************************************************
- * Calibration
- * ******************************************************/
+// ============================================================
+//  Calibration
+// ============================================================
 void runCalibration()
 {
     static uint32_t samples  = 0;
-    static uint32_t gsrSum   = 0;
-    static uint32_t lightSum = 0;
-    static uint32_t blinkSum = 0;
+    static uint64_t gsrSum   = 0;
+    static uint64_t lightSum = 0;
 
-    gsrSum   += analogRead(PIN_GSR);
+    gsrSum   += adcAverage(PIN_GSR, GSR_SAMPLES);
     lightSum += analogRead(PIN_LDR);
-    blinkSum += analogRead(PIN_BLINK_AO);
     samples++;
 
-    if (millis() - calibrationStart >= CALIBRATION_TIME)
+    if (millis() - calibrationStart >= CALIBRATION_TIME_MS)
     {
         basira.gsr.baseline   = (float)gsrSum   / samples;
-        basira.light.baseline = lightSum / samples;
-        basira.blink.baseline = blinkSum / samples;
-
+        basira.light.baseline = (uint16_t)(lightSum / samples);
+        basira.gsr.onSkin     = (basira.gsr.baseline < GSR_FLOATING_THRESHOLD);
         basira.gsr.filtered   = basira.gsr.baseline;
 
-        calibrationFinished = true;
-        basira.decision.state = SYSTEM_MONITORING;
-        blinkWindowStart      = millis();
+        calibrationFinished       = true;
+        basira.decision.state     = SYSTEM_MONITORING;
 
-        Serial.println("Calibration Completed");
-        Serial.print("Blink Baseline : "); Serial.println(basira.blink.baseline);
-        Serial.print("GSR   Baseline : "); Serial.println(basira.gsr.baseline);
-        Serial.print("Light Baseline : "); Serial.println(basira.light.baseline);
+        uint32_t now = millis();
+        blinkWindowStart                 = now;
+        basira.blink.percloseWindowStart = now;
+        lastPerclosTickMs                = now;
+
+        Serial.println("\n=== Calibration Complete ===");
+        Serial.print("  GSR baseline   : "); Serial.println(basira.gsr.baseline);
+        Serial.print("  GSR on-skin    : ");
+        if (basira.gsr.onSkin)
+            Serial.println("YES — electrodes detected");
+        else
+            Serial.println("NO — place BOTH electrodes on index+middle finger then restart");
+        Serial.print("  Light baseline : "); Serial.println(basira.light.baseline);
+        Serial.println("  Blink thresholds (verified 12-bit ADC_11db):");
+        Serial.print("    OPEN=");   Serial.print(BLINK_OPEN_THRESHOLD);
+        Serial.print("  CLOSED="); Serial.println(BLINK_CLOSED_THRESHOLD);
+        Serial.println("============================\n");
     }
 }
 
-/********************************************************
- * Sensor Drivers
- * ******************************************************/
+// ============================================================
+//  Sensor: Blink
+//
+//  FIX-1: Edge detection (blinkCount++) moved here from
+//  calculateBlinkFeatures(). This function runs every 20ms —
+//  fast enough to catch any blink ≥40ms duration.
+//
+//  PERCLOS accumulation also here (unchanged from v3.2).
+// ============================================================
 void readBlinkSensor()
 {
-    basira.blink.analog  = analogRead(PIN_BLINK_AO);
-    basira.blink.digital = digitalRead(PIN_BLINK_DO);
-    basira.blink.eye     = (basira.blink.digital == LOW) ? EYE_CLOSED : EYE_OPEN;
+    basira.blink.analog = adcAverage(PIN_BLINK_AO, TCRT_SAMPLES);
+    uint16_t val = basira.blink.analog;
+
+    // Hysteresis state machine
+    EyeState newState = basira.blink.eye;
+    if (basira.blink.eye != EYE_CLOSED && val < BLINK_CLOSED_THRESHOLD)
+        newState = EYE_CLOSED;
+    else if (basira.blink.eye != EYE_OPEN && val > BLINK_OPEN_THRESHOLD)
+        newState = EYE_OPEN;
+    // [1700..2200]: hold current state — hysteresis dead-band
+
+    if (newState == EYE_UNKNOWN) newState = EYE_OPEN;
+    basira.blink.eye = newState;
+
+    // ── FIX-1: BLINK EDGE DETECTION at 20ms resolution ──────
+    bool isClosed  = (basira.blink.eye == EYE_CLOSED);
+    bool wasClosed = (previousEyeState == EYE_CLOSED);
+
+    // Eye just closed (OPEN → CLOSED transition)
+    if (isClosed && !wasClosed)
+    {
+        eyeClosedStart = millis();
+    }
+
+    // Eye just opened (CLOSED → OPEN transition) → one blink completed
+    if (!isClosed && wasClosed)
+    {
+        uint32_t dur = millis() - eyeClosedStart;
+        // Accept blinks between 50ms (physiological minimum) and 800ms
+        if (dur >= 50 && dur <= 800)
+        {
+            basira.blink.eyeClosureTime = (uint16_t)dur;
+            basira.blink.blinkCount++;   // ← this was missing at 20ms resolution
+        }
+    }
+
+    previousEyeState = basira.blink.eye;
+    // ─────────────────────────────────────────────────────────
+
+    // PERCLOS accumulation: add real elapsed ms when eye is closed
+    uint32_t now = millis();
+    if (basira.blink.eye == EYE_CLOSED)
+    {
+        uint32_t elapsed = now - lastPerclosTickMs;
+        if (elapsed < BLINK_PERIOD * 4)
+            basira.blink.closedMsInWindow += elapsed;
+    }
+    lastPerclosTickMs = now;
 }
 
-void filterGSR()
+// ============================================================
+//  Sensor: GSR
+// ============================================================
+void readGSRSensor()
 {
-    const float alpha   = 0.20f;
-    static bool firstSample = true;
+    const float alpha = 0.20f;
+    basira.gsr.raw    = adcAverage(PIN_GSR, GSR_SAMPLES);
+    basira.gsr.onSkin = (basira.gsr.raw < GSR_FLOATING_THRESHOLD);
+    basira.gsr.filtered = alpha * basira.gsr.raw + (1.0f - alpha) * basira.gsr.filtered;
 
-    if (firstSample)
+    if (basira.gsr.onSkin)
+        basira.gsr.delta = basira.gsr.filtered - basira.gsr.baseline;
+    else
+        basira.gsr.delta = 0.0f;
+}
+
+// ============================================================
+//  Sensor: Light — FIX-3: restored v3.0 behavior with hysteresis
+// ============================================================
+void readLightSensor()
+{
+    basira.light.raw = adcAverage(PIN_LDR, 8);
+    int diff = (int)basira.light.raw - (int)basira.light.baseline;
+
+    LightState current = basira.light.state;
+    LightState next    = current;
+
+    if (current == LIGHT_DARK)
     {
-        basira.gsr.filtered = (float)basira.gsr.raw;
-        firstSample = false;
+        if (diff > THRESHOLD_LIGHT_DARK + THRESHOLD_LIGHT_HYST)   next = LIGHT_NORMAL;
+    }
+    else if (current == LIGHT_BRIGHT)
+    {
+        if (diff < THRESHOLD_LIGHT_BRIGHT - THRESHOLD_LIGHT_HYST) next = LIGHT_NORMAL;
     }
     else
     {
-        basira.gsr.filtered = alpha * basira.gsr.raw +
-                              (1.0f - alpha) * basira.gsr.filtered;
+        if      (diff < THRESHOLD_LIGHT_DARK   - THRESHOLD_LIGHT_HYST) next = LIGHT_DARK;
+        else if (diff > THRESHOLD_LIGHT_BRIGHT + THRESHOLD_LIGHT_HYST) next = LIGHT_BRIGHT;
+        else                                                             next = LIGHT_NORMAL;
     }
+    if (current == LIGHT_UNKNOWN) next = LIGHT_NORMAL;
+
+    basira.light.state    = next;
+    basira.light.lastDiff = diff;
 }
 
-void readGSRSensor()
-{
-    basira.gsr.raw = analogRead(PIN_GSR);
-    filterGSR();
-    basira.gsr.delta = basira.gsr.filtered - basira.gsr.baseline;
-}
-
-void evaluateLightState()
-{
-    int diff = (int)basira.light.raw - (int)basira.light.baseline;
-
-    if      (diff < THRESHOLD_LIGHT_DARK)   basira.light.state = LIGHT_DARK;
-    else if (diff > THRESHOLD_LIGHT_BRIGHT) basira.light.state = LIGHT_BRIGHT;
-    else                                    basira.light.state = LIGHT_NORMAL;
-}
-
-void readLightSensor()
-{
-    basira.light.raw = analogRead(PIN_LDR);
-    evaluateLightState();
-}
-
+// ============================================================
+//  Sensor: Heart — RR bounds check prevents HRV inflation
+// ============================================================
 void updateRRBuffer(uint16_t rr)
 {
     rrHistory[rrIndex] = rr;
-    rrIndex = (rrIndex + 1) % RR_BUFFER_SIZE;
-    if (rrSamples < RR_BUFFER_SIZE) rrSamples++;
+    rrIndex = (rrIndex + 1) % RR_BUF;
+    if (rrSamples < RR_BUF) rrSamples++;
 }
 
 void clearHeartBuffer()
 {
     memset(rrHistory, 0, sizeof(rrHistory));
-    rrIndex = 0;
-    rrSamples = 0;
+    rrIndex = 0; rrSamples = 0;
 }
 
 void readHeartSensor()
@@ -417,48 +566,35 @@ void readHeartSensor()
     if (basira.heart.ir < IR_ON_SKIN_THRESHOLD)
     {
         basira.heart.skin         = OFF_SKIN;
-        basira.heart.beatDetected = false;
         basira.heart.bpm          = 0.0f;
         basira.heart.averageBPM   = 0.0f;
         basira.heart.rr           = 0;
         basira.heart.hrv          = 0.0f;
+        basira.heart.beatDetected = false;
         clearHeartBuffer();
         return;
     }
-
     basira.heart.skin = ON_SKIN;
 
     if (checkForBeat(basira.heart.ir))
     {
-        basira.heart.beatDetected = true;
-
         static uint32_t lastBeat = 0;
         uint32_t now = millis();
-
         if (lastBeat != 0)
         {
             uint32_t rr = now - lastBeat;
-            basira.heart.rr = rr;
-            updateRRBuffer(rr);
-
-            float bpm = 60000.0f / rr;
-
-            if (bpm >= MIN_BPM && bpm <= MAX_BPM)
+            if (rr >= RR_MIN_MS && rr <= RR_MAX_MS)
             {
+                basira.heart.rr = (uint16_t)rr;
+                updateRRBuffer((uint16_t)rr);
+                float bpm = 60000.0f / rr;
                 basira.heart.bpm = bpm;
-
-                if (basira.heart.averageBPM == 0.0f)
-                {
-                    basira.heart.averageBPM = bpm;
-                }
-                else
-                {
-                    basira.heart.averageBPM = 0.90f * basira.heart.averageBPM +
-                                              0.10f * bpm;
-                }
+                basira.heart.averageBPM = (basira.heart.averageBPM < 1.0f)
+                    ? bpm : 0.90f * basira.heart.averageBPM + 0.10f * bpm;
             }
         }
-        lastBeat = now;
+        lastBeat              = now;
+        basira.heart.beatDetected = true;
     }
     else
     {
@@ -466,68 +602,69 @@ void readHeartSensor()
     }
 }
 
-/********************************************************
- * Feature Extraction
- * ******************************************************/
-void calculateBlinkRate()
+// ============================================================
+//  Feature: Blink rate window (30s)
+//
+//  FIX-1: Edge detection REMOVED from here — it lives in
+//  readBlinkSensor() now. This function only handles the
+//  30-second rate calculation and PERCLOS window reset.
+// ============================================================
+void calculateBlinkFeatures()
 {
-    bool eyeClosed = (basira.blink.eye == EYE_CLOSED);
+    uint32_t now = millis();
 
-    if (eyeClosed && !previousEyeClosed)
-        eyeClosedStart = millis();
-
-    if (!eyeClosed && previousEyeClosed)
+    // Live PERCLOS: recalculate every second from partial window
+    uint32_t windowElapsed = now - basira.blink.percloseWindowStart;
+    if (windowElapsed > 0)
     {
-        uint32_t duration = millis() - eyeClosedStart;
-        if (duration >= 50 && duration <= 800)
-        {
-            basira.blink.eyeClosureTime = duration;
-            basira.blink.blinkCount++;
-        }
+        float live = 100.0f * (float)basira.blink.closedMsInWindow / (float)windowElapsed;
+        basira.blink.perclos = constrain(live, 0.0f, 100.0f);
     }
 
-    previousEyeClosed = eyeClosed;
-
-    uint32_t elapsed = millis() - blinkWindowStart;
-
-    if (elapsed >= BLINK_WINDOW)
+    // Full 60s window expiry: reset accumulator
+    if (windowElapsed >= PERCLOS_WINDOW_MS)
     {
-        float minutes = elapsed / 60000.0f;
-        basira.blink.blinkRate   = basira.blink.blinkCount / minutes;
+        basira.blink.closedMsInWindow    = 0;
+        basira.blink.percloseWindowStart = now;
+    }
+
+    // 30s blink rate window
+    uint32_t blinkElapsed = now - blinkWindowStart;
+    if (blinkElapsed >= 30000UL)
+    {
+        float minutes = blinkElapsed / 60000.0f;
+        basira.blink.blinkRate   = (minutes > 0.0f)
+            ? (float)basira.blink.blinkCount / minutes : 0.0f;
         basira.blink.blinkCount  = 0;
         basira.blink.windowReady = true;
-        blinkWindowStart         = millis();
+        blinkWindowStart         = now;
     }
 }
 
+// ============================================================
+//  Feature: HRV
+// ============================================================
 void calculateHRV()
 {
     if (rrSamples < 5) return;
-
     float sum = 0.0f;
     for (uint8_t i = 1; i < rrSamples; i++)
         sum += abs((int)rrHistory[i] - (int)rrHistory[i - 1]);
-
     basira.heart.hrv = sum / (rrSamples - 1);
 }
 
 void extractFeatures()
 {
-    calculateBlinkRate();
+    calculateBlinkFeatures();
     calculateHRV();
 }
 
-/********************************************************
- * Physiological Assessment
- * ******************************************************/
+// ============================================================
+//  Physiology evaluation
+// ============================================================
 void evaluateBlinkStatus()
 {
-    if (!basira.blink.windowReady)
-    {
-        basira.physiology.blink = BLINK_UNKNOWN;
-        return;
-    }
-
+    if (!basira.blink.windowReady) { basira.physiology.blink = BLINK_UNKNOWN; return; }
     if      (basira.blink.blinkRate >= 12) basira.physiology.blink = BLINK_NORMAL;
     else if (basira.blink.blinkRate >= 8)  basira.physiology.blink = BLINK_LOW;
     else                                   basira.physiology.blink = BLINK_VERY_LOW;
@@ -535,26 +672,24 @@ void evaluateBlinkStatus()
 
 void evaluateHeartStatus()
 {
-    if (basira.heart.skin == OFF_SKIN)
-    { basira.physiology.heart = HEART_UNKNOWN; return; }
-
-    basira.physiology.heart =
-        (basira.heart.averageBPM > THRESHOLD_HEART_HIGH) ? HEART_HIGH : HEART_NORMAL;
+    if (basira.heart.skin == OFF_SKIN) { basira.physiology.heart = HEART_UNKNOWN; return; }
+    basira.physiology.heart = (basira.heart.averageBPM > THRESHOLD_HEART_HIGH)
+        ? HEART_HIGH : HEART_NORMAL;
 }
 
 void evaluateHRVStatus()
 {
     if (basira.heart.skin == OFF_SKIN || rrSamples < 5)
     { basira.physiology.hrv = HRV_UNKNOWN; return; }
-
-    basira.physiology.hrv =
-        (basira.heart.hrv < THRESHOLD_HRV_LOW) ? HRV_LOW : HRV_NORMAL;
+    basira.physiology.hrv = (basira.heart.hrv < THRESHOLD_HRV_LOW)
+        ? HRV_LOW : HRV_NORMAL;
 }
 
 void evaluateGSRStatus()
 {
-    basira.physiology.gsr =
-        (basira.gsr.delta < THRESHOLD_GSR_ELEVATED) ? GSR_ELEVATED : GSR_NORMAL;
+    if (!basira.gsr.onSkin) { basira.physiology.gsr = GSR_UNKNOWN; return; }
+    basira.physiology.gsr = (basira.gsr.delta < THRESHOLD_GSR_ELEVATED)
+        ? GSR_ELEVATED : GSR_NORMAL;
 }
 
 void evaluatePhysiology()
@@ -565,61 +700,62 @@ void evaluatePhysiology()
     evaluateGSRStatus();
 }
 
-/********************************************************
- * Decision Engine
- * ******************************************************/
-void calculateRiskScore()
-{
-    basira.decision.riskScore = 0;
-
-    switch (basira.physiology.blink)
-    {
-        case BLINK_LOW:      basira.decision.riskScore += 2; break;
-        case BLINK_VERY_LOW: basira.decision.riskScore += 4; break;
-        default: break;
-    }
-
-    if (basira.physiology.heart == HEART_HIGH)    basira.decision.riskScore += 1;
-    if (basira.physiology.hrv   == HRV_LOW)       basira.decision.riskScore += 1;
-    if (basira.physiology.gsr   == GSR_ELEVATED)  basira.decision.riskScore += 1;
-    if (basira.light.state      == LIGHT_DARK)    basira.decision.riskScore += 1;
-    if (basira.light.state      == LIGHT_BRIGHT)  basira.decision.riskScore += 1;
-}
-
+// ============================================================
+//  Decision engine
+// ============================================================
 void updateDecisionEngine()
 {
-    calculateRiskScore();
+    basira.decision.vibration = false;
+    basira.decision.riskScore = 0;
 
     if (basira.heart.skin == OFF_SKIN)
     {
-        basira.decision.state     = SYSTEM_MONITORING;
-        basira.decision.vibration = false;
+        basira.decision.state = SYSTEM_MONITORING;
         return;
     }
 
-    if      (basira.decision.riskScore <= 1)
-    { basira.decision.state = SYSTEM_HEALTHY;        basira.decision.vibration = false; }
-    else if (basira.decision.riskScore <= 3)
-    { basira.decision.state = SYSTEM_MILD_FATIGUE;   basira.decision.vibration = false; }
-    else if (basira.decision.riskScore <= 5)
-    { basira.decision.state = SYSTEM_VISUAL_FATIGUE; basira.decision.vibration = true;  }
-    else
-    { basira.decision.state = SYSTEM_HIGH_STRESS;    basira.decision.vibration = true;  }
+    // Severe visual fatigue
+    if (basira.blink.perclos >= 40.0f)
+    {
+        basira.decision.state = SYSTEM_VISUAL_FATIGUE;
+        basira.decision.vibration = true;
+        basira.decision.riskScore = 3;
+        return;
+    }
+
+    // Physiological stress
+    if (basira.physiology.hrv == HRV_LOW &&
+        basira.physiology.gsr == GSR_ELEVATED)
+    {
+        basira.decision.state = SYSTEM_HIGH_STRESS;
+        basira.decision.vibration = true;
+        basira.decision.riskScore = 2;
+        return;
+    }
+
+    // Mild fatigue
+    if (basira.blink.perclos >= 20.0f)
+    {
+        basira.decision.state = SYSTEM_MILD_FATIGUE;
+        basira.decision.riskScore = 1;
+        return;
+    }
+
+    basira.decision.state = SYSTEM_HEALTHY;
 }
 
-/********************************************************
- * Motor Controller
- * ******************************************************/
+// ============================================================
+//  Motor (non-blocking)
+// ============================================================
 void updateMotor()
 {
     if (basira.decision.vibration && !motorRunning)
     {
         digitalWrite(PIN_MOTOR, HIGH);
-        motorRunning    = true;
-        motorStartTime  = millis();
+        motorRunning   = true;
+        motorStartTime = millis();
     }
-
-    if (motorRunning && (millis() - motorStartTime >= MOTOR_PULSE_TIME))
+    if (motorRunning && millis() - motorStartTime >= MOTOR_PULSE_MS)
     {
         digitalWrite(PIN_MOTOR, LOW);
         motorRunning              = false;
@@ -627,10 +763,10 @@ void updateMotor()
     }
 }
 
-/********************************************************
- * Enum mapping — internal enums → shared protocol enums
- * ******************************************************/
-uint8_t mapSystemState(SystemState s)
+// ============================================================
+//  Protocol enum mapping
+// ============================================================
+uint8_t mapState(SystemState s)
 {
     switch (s)
     {
@@ -645,93 +781,125 @@ uint8_t mapSystemState(SystemState s)
     }
 }
 
-uint8_t mapLightState(LightState s)
+uint8_t mapLight(LightState s)
 {
     switch (s)
     {
         case LIGHT_DARK:   return BLIGHT_DARK;
-        case LIGHT_NORMAL: return BLIGHT_NORMAL;
         case LIGHT_BRIGHT: return BLIGHT_BRIGHT;
+        case LIGHT_NORMAL: return BLIGHT_NORMAL;
         default:           return BLIGHT_UNKNOWN;
     }
 }
 
-/********************************************************
- * Text Helpers (USB debug only — not sent over BLE)
- * ******************************************************/
-const char* systemStateToString(SystemState s)
-{
-    switch(s)
-    {
-        case SYSTEM_STARTUP:        return "STARTUP";
-        case SYSTEM_CALIBRATION:    return "CALIBRATION";
-        case SYSTEM_MONITORING:     return "MONITORING";
-        case SYSTEM_HEALTHY:        return "HEALTHY";
-        case SYSTEM_MILD_FATIGUE:   return "MILD_FATIGUE";
-        case SYSTEM_VISUAL_FATIGUE: return "VISUAL_FATIGUE";
-        case SYSTEM_HIGH_STRESS:    return "HIGH_STRESS";
-        default:                    return "UNKNOWN";
-    }
-}
-
-const char* lightStateToString(LightState s)
-{
-    switch(s)
-    {
-        case LIGHT_DARK:   return "DARK";
-        case LIGHT_NORMAL: return "NORMAL";
-        case LIGHT_BRIGHT: return "BRIGHT";
-        default:           return "UNKNOWN";
-    }
-}
-
-/********************************************************
- * USB Debug Dump (human-readable, USB serial monitor only)
- * ******************************************************/
-void printDebugDump()
-{
-    Serial.println();
-    Serial.println("========================================");
-    Serial.print  ("Heart Rate     : "); Serial.print(basira.heart.averageBPM); Serial.println(" BPM");
-    Serial.print  ("Blink Rate     : ");
-    if (basira.blink.windowReady) { Serial.print(basira.blink.blinkRate); Serial.println(" blinks/min"); }
-    else                          { Serial.println("Calculating..."); }
-    Serial.print  ("Approx HRV     : "); Serial.println(basira.heart.hrv);
-    Serial.print  ("GSR Filtered   : "); Serial.println(basira.gsr.filtered);
-    Serial.print  ("GSR Delta      : "); Serial.println(basira.gsr.delta);
-    Serial.print  ("Light State    : "); Serial.println(lightStateToString(basira.light.state));
-    Serial.print  ("Risk Score     : "); Serial.println(basira.decision.riskScore);
-    Serial.print  ("System State   : "); Serial.println(systemStateToString(basira.decision.state));
-    Serial.print  ("BLE Client     : "); Serial.println(bleClientConnected ? "CONNECTED" : "NOT CONNECTED");
-    Serial.println("========================================");
-}
-
-/********************************************************
- * BLE Notify — builds the packed struct and pushes it
- * ******************************************************/
+// ============================================================
+//  BLE packet send
+// ============================================================
 void sendBlePacket()
 {
-    if (!bleClientConnected) return;
+    if (!bleConnected) return;
 
-    BasiraPacket packet;
-    packet.seq             = packetSeq++;
-    packet.heartRateBpm    = basira.heart.averageBPM;
-    packet.blinkRatePerMin = basira.blink.windowReady ? basira.blink.blinkRate : 0.0f;
-    packet.hrv             = basira.heart.hrv;
-    packet.gsrFiltered     = (int16_t)basira.gsr.filtered;
-    packet.gsrDelta        = (int16_t)basira.gsr.delta;
-    packet.lightState      = mapLightState(basira.light.state);
-    packet.systemState     = mapSystemState(basira.decision.state);
-    packet.onSkin           = (basira.heart.skin == ON_SKIN) ? 1 : 0;
-    packet.vibrating        = basira.decision.vibration ? 1 : 0;
+    BasiraPacket pkt;
+    pkt.seq             = packetSeq++;
+    pkt.heartRateBpm    = basira.heart.averageBPM;
+    pkt.blinkRatePerMin = basira.blink.windowReady ? basira.blink.blinkRate : 0.0f;
+    pkt.hrv             = basira.heart.hrv;
+    pkt.perclos         = basira.blink.perclos;
+    pkt.gsrFiltered     = (int16_t)basira.gsr.filtered;
+    pkt.gsrDelta        = basira.gsr.onSkin ? (int16_t)basira.gsr.delta : 0;
+    pkt.lightState      = mapLight(basira.light.state);
+    pkt.systemState     = mapState(basira.decision.state);
+    pkt.onSkin          = (basira.heart.skin == ON_SKIN) ? 1 : 0;
+    pkt.vibrating       = basira.decision.vibration ? 1 : 0;
 
-    bleDataChar->setValue((uint8_t*)&packet, sizeof(BasiraPacket));
+    bleDataChar->setValue((uint8_t*)&pkt, sizeof(BasiraPacket));
     bleDataChar->notify();
 }
 
-/********************************************************
- * Main Loop
- * ******************************************************/
+// ============================================================
+//  USB debug dump
+// ============================================================
+void printDebug()
+{
+    Serial.println("\n========================================");
+    Serial.print("BLINK raw   : "); Serial.print(basira.blink.analog);
+    Serial.print("  eye=");
+    Serial.print(basira.blink.eye == EYE_CLOSED ? "CLOSED" : "OPEN");
+    Serial.print("  count="); Serial.println(basira.blink.blinkCount);
+    Serial.print("BLINK rate  : ");
+    if (basira.blink.windowReady)
+        { Serial.print(basira.blink.blinkRate, 1); Serial.println(" /min"); }
+    else
+        Serial.println("(30s window not ready)");
+    Serial.print("PERCLOS     : "); Serial.print(basira.blink.perclos, 1); Serial.println(" %");
+
+    Serial.print("GSR raw     : "); Serial.println(basira.gsr.raw);
+    Serial.print("  on-skin=");
+    Serial.println(basira.gsr.onSkin ? "YES" : "NO — attach both electrodes to skin");
+    Serial.print("GSR filtered: "); Serial.println(basira.gsr.filtered, 1);
+    Serial.print("GSR delta   : "); Serial.println(basira.gsr.delta, 1);
+
+    Serial.print("Heart Rate  : ");
+    if (basira.heart.skin == ON_SKIN)
+        { Serial.print(basira.heart.averageBPM, 1); Serial.println(" BPM"); }
+    else
+        Serial.println("(off-skin)");
+    Serial.print("HRV         : ");
+    if (rrSamples >= 5)
+        { Serial.print(basira.heart.hrv, 1); Serial.println(" ms"); }
+    else
+        { Serial.print("(need "); Serial.print(5 - rrSamples); Serial.println(" more beats)"); }
+
+    Serial.print("Light diff  : "); Serial.print(basira.light.lastDiff);
+    Serial.print("  state=");
+    switch (basira.light.state) {
+        case LIGHT_DARK:   Serial.println("DARK");   break;
+        case LIGHT_BRIGHT: Serial.println("BRIGHT"); break;
+        case LIGHT_NORMAL: Serial.println("NORMAL"); break;
+        default:           Serial.println("UNKNOWN");
+    }
+    Serial.print("Risk score  : "); Serial.println(basira.decision.riskScore);
+    Serial.print("System state: ");
+    switch (basira.decision.state) {
+        case SYSTEM_HEALTHY:        Serial.println("HEALTHY");        break;
+        case SYSTEM_MILD_FATIGUE:   Serial.println("MILD_FATIGUE");   break;
+        case SYSTEM_VISUAL_FATIGUE: Serial.println("VISUAL_FATIGUE"); break;
+        case SYSTEM_HIGH_STRESS:    Serial.println("HIGH_STRESS");    break;
+        case SYSTEM_MONITORING:     Serial.println("MONITORING");     break;
+        default:                    Serial.println("STARTUP/CALIB");  break;
+    }
+    Serial.print("BLE         : "); Serial.println(bleConnected ? "CONNECTED" : "NOT CONNECTED");
+    Serial.println("========================================");
+}
+
+// ============================================================
+//  Setup
+// ============================================================
+void setup()
+{
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("========================================");
+    Serial.println(" BASIRA Smart Glasses  Firmware v3.3.0");
+    Serial.println("========================================");
+    Serial.println(" IMPORTANT: Before calibration starts,");
+    Serial.println(" place BOTH GSR electrodes on skin.");
+    Serial.println(" Calibration lasts 5 seconds.");
+    Serial.println("========================================");
+
+    initializeHardware();
+    initializeBLE();
+
+    calibrationStart      = millis();
+    basira.decision.state = SYSTEM_CALIBRATION;
+    timerBleNotify        = 0;
+
+    Serial.println("Calibrating — keep still for 5 seconds...");
+}
+
+// ============================================================
+//  Loop
+// ============================================================
 void loop()
 {
     if (!calibrationFinished)
@@ -742,26 +910,21 @@ void loop()
 
     uint32_t now = millis();
 
-    // Independent hardware task scheduler — runs regardless of BLE state,
-    // so the glasses keep protecting the wearer (vibration) even unpaired.
-    if (taskReady(now, timerHeart,    HEART_PERIOD))    readHeartSensor();
-    if (taskReady(now, timerBlink,    BLINK_PERIOD))    readBlinkSensor();
-    if (taskReady(now, timerGSR,      GSR_PERIOD))      readGSRSensor();
-    if (taskReady(now, timerLight,    LIGHT_PERIOD))    readLightSensor();
-    if (taskReady(now, timerFeature,  FEATURE_PERIOD))  extractFeatures();
-
+    if (taskReady(now, timerHeart,    HEART_PERIOD))   readHeartSensor();
+    if (taskReady(now, timerBlink,    BLINK_PERIOD))   readBlinkSensor();   // FIX-1: edge detection here
+    if (taskReady(now, timerGSR,      GSR_PERIOD))     readGSRSensor();
+    if (taskReady(now, timerLight,    LIGHT_PERIOD))   readLightSensor();
+    if (taskReady(now, timerFeature,  FEATURE_PERIOD)) extractFeatures();   // rate calc only
     if (taskReady(now, timerDecision, DECISION_PERIOD))
     {
         evaluatePhysiology();
         updateDecisionEngine();
     }
-
     if (taskReady(now, timerBleNotify, BLE_NOTIFY_PERIOD))
     {
         sendBlePacket();
-        printDebugDump(); // safe to leave on — goes to USB serial, not BLE
+        printDebug();
     }
 
-    // Runs every loop iteration for precise 300ms cutoff, independent of scheduler.
     updateMotor();
 }
